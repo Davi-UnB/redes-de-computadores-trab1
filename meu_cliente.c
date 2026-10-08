@@ -4,10 +4,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/time.h>
 
 #define PORTA_DNS 53
 #define TAM_MAX_DNS 512 // Tamanho máximo de uma mensagem DNS via UDP (RFC 1035, seção 2.3.4)
+#define MAX_TENTATIVAS 3   // Enunciado: até 3 tentativas de resolução
+#define TIMEOUT_SEGUNDOS 2 // Enunciado: aguardar 2 segundos pela resposta
 
 
 static void escreve_16(uint8_t *buf, size_t *pos, uint16_t v) {
@@ -116,6 +122,69 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Erro: dominio invalido: %s\n", dominio);
     return EXIT_FAILURE;
   }
+
+  // Cria Socket UDP
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    perror("socket");
+    return EXIT_FAILURE;
+  }
+
+  // Define o tempo máximo de espera do recvfrom
+  struct timeval timeout = {.tv_sec = TIMEOUT_SEGUNDOS, .tv_usec = 0};
+  if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+    perror("setsockopt");
+    close(sock);
+    return EXIT_FAILURE;
+  }
+
+  uint8_t resposta[TAM_MAX_DNS] = {0}; // Buffer da resposta
+  ssize_t recebidos = -1;              
+
+  for (int tentativa = 0; tentativa < MAX_TENTATIVAS; tentativa++) {
+    // Envia (ou reenvia) a consulta
+    ssize_t enviados = sendto(sock, consulta, tam_consulta, 0,(struct sockaddr *)&servidor, sizeof(servidor));
+    if (enviados < 0) {
+      perror("sendto");
+      close(sock);
+      return EXIT_FAILURE;
+    }
+
+    // Espera a resposta por até TIMEOUT_SEGUNDOS
+    recebidos = recvfrom(sock, resposta, sizeof(resposta), 0, NULL, NULL);
+    if (recebidos < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        continue; // Tempo esgotado: tenta de novo
+      perror("recvfrom");
+      close(sock);
+      return EXIT_FAILURE;
+    }
+
+    // Descarta respostas menores que um cabeçalho ou de outra consulta
+    uint16_t id_resposta = (uint16_t)((resposta[0] << 8) | resposta[1]);
+    if (recebidos < 12 || id_resposta != id) {
+      recebidos = -1;
+      continue;
+    }
+
+    break; // Resposta válida recebida
+  }
+
+  close(sock); // O socket não é mais necessário
+
+  if (recebidos < 0) {
+    printf("Nao foi possível coletar entrada MX para %s\n", dominio);
+    return EXIT_FAILURE;
+  }
+
+  // Temporário: mostra os bytes recebidos para conferência
+  printf("Resposta (%zd bytes):\n", recebidos);
+  for (ssize_t i = 0; i < recebidos; i++) {
+    printf("%02x ", resposta[i]);
+    if ((i + 1) % 16 == 0)
+      printf("\n");
+  }
+  printf("\n");
 
   return EXIT_SUCCESS;
 }

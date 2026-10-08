@@ -58,3 +58,7 @@ dkms.conf
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# projeto
+meu_cliente
+.vscode/
