@@ -14,6 +14,10 @@
 #define TAM_MAX_DNS 512    // Tamanho máximo de uma mensagem DNS via UDP (RFC 1035, seção 2.3.4)
 #define MAX_TENTATIVAS 3   // Enunciado: até 3 tentativas de resolução
 #define TIMEOUT_SEGUNDOS 2 // Enunciado: aguardar 2 segundos pela resposta
+#define TAM_MAX_NOME 256   // Nome de domínio: até 255 letras mais o '\0' final (RFC 1035, seção 3.1)
+#define MAX_SALTOS 20      // Limite de ponteiros de compressão seguidos (evita laço infinito)
+#define TIPO_MX 15         // TYPE do registro MX (RFC 1035, seção 3.2.2)
+#define CLASSE_IN 1        // CLASS da Internet (RFC 1035, seção 3.2.4)
 
 static void escreve_16(uint8_t *buf, size_t *pos, uint16_t v) {
   buf[*pos] = (uint8_t)(v >> 8);
@@ -98,6 +102,78 @@ static int le_16(const uint8_t *buf, size_t tam, size_t *pos) {
   return valor;
 }
 
+// Lê um nome de domínio da resposta e o escreve como texto em saida
+static char *le_nome(const uint8_t *resp, size_t tam, size_t *pos, char *saida, size_t tam_saida) {
+  size_t p = *pos;        // Posição de leitura local
+  size_t pos_retorno = 0; // Onde o registro continua depois do nome
+  int saltou = 0;         // 1 depois do primeiro ponteiro seguido
+  int saltos = 0;         // Quantos ponteiros já seguimos (para detectar loop)
+  size_t tam_nome = 0;    // Quantos caracteres já escrevemos em saida
+
+  while (1) {
+    // Toda leitura precisa estar dentro dos bytes recebidos
+    if (p >= tam)
+      return NULL;
+
+    uint8_t byte = resp[p];
+
+    // Byte 00: fim do nome
+    if (byte == 0) {
+      if (tam_nome >= tam_saida)
+        return NULL; // Sem espaço
+      saida[tam_nome] = '\0';
+
+      *pos = saltou ? pos_retorno : p + 1;
+      return saida;
+    }
+
+    // Dois bits mais altos iguais a 11 (byte >= 0xC0): ponteiro de 2 bytes
+    if ((byte & 0xC0) == 0xC0) {
+      if (p + 1 >= tam)
+        return NULL; // Falta o segundo byte do ponteiro
+      if (++saltos > MAX_SALTOS)
+        return NULL; // Ponteiros demais: um apontando para o outro em laço
+
+      if (!saltou) {
+        pos_retorno = p + 2; // Só o primeiro ponteiro marca onde o registro continua
+        saltou = 1;
+      }
+
+      // Os 6 bits baixos deste byte e os 8 bits do próximo formam a posição de destino
+      p = ((size_t)(byte & 0x3F) << 8) | resp[p + 1];
+      continue;
+    }
+
+    // Dois bits mais altos 01 ou 10 não são usados pela RFC 1035: formato inválido
+    if ((byte & 0xC0) != 0)
+      return NULL;
+
+    // Qualquer outro valor: número de letras que vêm a seguir
+    size_t n = byte;
+
+    if (p + 1 + n > tam)
+      return NULL; // As letras passariam do fim da resposta
+
+    // Espaço necessário em saida: '.' + letras + '\0'
+    size_t ponto = tam_nome > 0 ? 1 : 0; // Primeiro rótulo não tem ponto
+
+    if (tam_nome + ponto + n + 1 > tam_saida)
+      return NULL;
+
+    if (ponto)
+      saida[tam_nome++] = '.';                 // Separa o rótulo do anterior
+    memcpy(saida + tam_nome, resp + p + 1, n); // Copia as n letras, pulando o byte de tamanho
+    tam_nome += n;
+    p += n + 1; // Avança para o próximo rótulo: byte de tamanho + letras
+  }
+}
+
+// Informa que não foi possível obter o MX (falha do servidor ou resposta malformada)
+static int falha_coleta(const char *dominio) {
+  printf("Nao foi possível coletar entrada MX para %s\n", dominio);
+  return EXIT_FAILURE;
+}
+
 // Interpreta a resposta e imprime o resultado formatado
 static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *dominio) {
   size_t pos = 0;
@@ -107,11 +183,8 @@ static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *domi
 
   // Flags (2 bytes):
   int flags = le_16(resp, tam, &pos);
-
-  if (flags < 0) {
-    printf("Nao foi possível coletar entrada MX para %s\n", dominio);
-    return EXIT_FAILURE;
-  }
+  if (flags < 0)
+    return falha_coleta(dominio);
 
   int rcode = flags & 0x000F; // Pega últimos 4 bits
 
@@ -122,10 +195,19 @@ static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *domi
   }
 
   // Qualquer outro RCODE diferente de 0 é uma falha do servidor
-  if (rcode != 0) {
-    printf("Nao foi possível coletar entrada MX para %s\n", dominio);
-    return EXIT_FAILURE;
-  }
+  if (rcode != 0)
+    return falha_coleta(dominio);
+
+  // QDCOUNT (2 bytes): quantas perguntas a resposta repete
+  int qdcount = le_16(resp, tam, &pos);
+
+  // ANCOUNT (2 bytes): quantos registros de resposta vêm a seguir
+  int ancount = le_16(resp, tam, &pos);
+  if (qdcount < 0 || ancount < 0)
+    return falha_coleta(dominio);
+
+  // NSCOUNT e ARCOUNT (4 bytes):
+  pos += 4; // Pulamos
 
   // RCODE 0: sucesso
   return EXIT_SUCCESS;
