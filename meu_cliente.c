@@ -174,6 +174,60 @@ static int falha_coleta(const char *dominio) {
   return EXIT_FAILURE;
 }
 
+// Percorre os registros de resposta, a partir de *pos, e guarda o nome do servidor do MX de menor preferência
+static int acha_melhor_mx(const uint8_t *resp, size_t tam, size_t *pos, int ancount, char *melhor, size_t tam_melhor) {
+  // Nível de preferência do melhor MX até agora
+  int melhor_pref = -1; // -1 indica nenhum valor encontrado
+
+  // Cada volta lê um registro: NAME, TYPE, CLASS, TTL, RDLENGTH e RDATA
+  for (int i = 0; i < ancount; i++) {
+    // NAME: dono do registro.
+    char nome[TAM_MAX_NOME];
+    if (le_nome(resp, tam, pos, nome, sizeof(nome)) == NULL)
+      return -1;
+
+    // TYPE e CLASS (2 bytes cada)
+    int tipo = le_16(resp, tam, pos);
+    int classe = le_16(resp, tam, pos);
+    if (tipo < 0 || classe < 0)
+      return -1;
+
+    // TTL (4 bytes): ignorado
+    if (*pos + 4 > tam)
+      return -1;
+    *pos += 4;
+
+    // RDLENGTH (2 bytes): quantos bytes tem o RDATA
+    int rdlength = le_16(resp, tam, pos);
+    if (rdlength < 0 || *pos + (size_t)rdlength > tam)
+      return -1;
+
+    size_t fim_registro = *pos + (size_t)rdlength; // Onde o próximo registro começa
+
+    // Só nos interessam registros MX da classe IN (O resto é pulado)
+    if (tipo == TIPO_MX && classe == CLASSE_IN) {
+      // RDATA do MX: PREFERENCE (2 bytes) seguida do nome do servidor de e-mail
+      int pref = le_16(resp, tam, pos);
+      if (pref < 0)
+        return -1;
+
+      char exchange[TAM_MAX_NOME]; // Nome do servidor de e-mail do registro
+      if (le_nome(resp, tam, pos, exchange, sizeof(exchange)) == NULL)
+        return -1;
+
+      // Menor valor de preferência = servidor preferido
+      if (melhor_pref < 0 || pref < melhor_pref) {
+        melhor_pref = pref;
+        snprintf(melhor, tam_melhor, "%s", exchange); // Guarda uma cópia do nome
+      }
+    }
+
+    *pos = fim_registro; // Vai para o próximo registro
+  }
+
+  return melhor_pref >= 0; // Retorna se achou algum MX
+}
+
 // Interpreta a resposta e imprime o resultado formatado
 static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *dominio) {
   size_t pos = 0;
@@ -209,7 +263,32 @@ static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *domi
   // NSCOUNT e ARCOUNT (4 bytes):
   pos += 4; // Pulamos
 
-  // RCODE 0: sucesso
+  // Seção de pergunta: para cada pergunta, pula o nome e depois TYPE e CLASS (4 bytes)
+  for (int i = 0; i < qdcount; i++) {
+    char nome[TAM_MAX_NOME]; // Texto do nome da pergunta: não usamos, só avançamos o pos
+    if (le_nome(resp, tam, &pos, nome, sizeof(nome)) == NULL)
+      return falha_coleta(dominio);
+
+    if (pos + 4 > tam)
+      return falha_coleta(dominio);
+    pos += 4; // Pulamos TYPE e CLASS
+  }
+
+  // Seção de respostas: procura o MX de menor preferência
+  char melhor[TAM_MAX_NOME]; // Nome do servidor de e-mail preferido
+  int achou = acha_melhor_mx(resp, tam, &pos, ancount, melhor, sizeof(melhor));
+
+  // Resposta malformada
+  if (achou < 0)
+    return falha_coleta(dominio);
+
+  // Nenhum registro MX na resposta (inclui o caso do CNAME, como fga.unb.br)
+  if (achou == 0) {
+    printf("Dominio %s nao possui entrada MX\n", dominio);
+    return EXIT_FAILURE;
+  }
+
+  printf("%s <> %s\n", dominio, melhor);
   return EXIT_SUCCESS;
 }
 
