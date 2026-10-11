@@ -1,20 +1,23 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
-#include <errno.h>
-#include <sys/time.h>
 
 #define PORTA_DNS 53
-#define TAM_MAX_DNS 512 // Tamanho máximo de uma mensagem DNS via UDP (RFC 1035, seção 2.3.4)
+#define TAM_MAX_DNS 512    // Tamanho máximo de uma mensagem DNS via UDP (RFC 1035, seção 2.3.4)
 #define MAX_TENTATIVAS 3   // Enunciado: até 3 tentativas de resolução
 #define TIMEOUT_SEGUNDOS 2 // Enunciado: aguardar 2 segundos pela resposta
-
+#define TAM_MAX_NOME 256   // Nome de domínio: até 255 letras mais o '\0' final (RFC 1035, seção 3.1)
+#define MAX_SALTOS 20      // Limite de ponteiros de compressão seguidos (evita laço infinito)
+#define TIPO_MX 15         // TYPE do registro MX (RFC 1035, seção 3.2.2)
+#define CLASSE_IN 1        // CLASS da Internet (RFC 1035, seção 3.2.4)
 
 static void escreve_16(uint8_t *buf, size_t *pos, uint16_t v) {
   buf[*pos] = (uint8_t)(v >> 8);
@@ -22,14 +25,14 @@ static void escreve_16(uint8_t *buf, size_t *pos, uint16_t v) {
   *pos += 2;
 }
 
-static int escreve_nome(uint8_t *buf, size_t *pos, size_t tam_buf,const char *dominio) {
-  size_t p = *pos;         // Posição de escrita local
-  size_t idx_tam;          // Onde fica o byte de tamanho do rótulo atual
-  size_t tam_rotulo = 0;   // Letras contadas no rótulo atual
+static int escreve_nome(uint8_t *buf, size_t *pos, size_t tam_buf, const char *dominio) {
+  size_t p = *pos;       // Posição de escrita local
+  size_t idx_tam;        // Onde fica o byte de tamanho do rótulo atual
+  size_t tam_rotulo = 0; // Letras contadas no rótulo atual
 
   if (p >= tam_buf)
     return -1;
-  idx_tam = p++;           // Reserva o byte de tamanho do primeiro rótulo
+  idx_tam = p++; // Reserva o byte de tamanho do primeiro rótulo
 
   for (const char *c = dominio;; c++) {
     if (*c == '.' || *c == '\0') {
@@ -40,32 +43,32 @@ static int escreve_nome(uint8_t *buf, size_t *pos, size_t tam_buf,const char *do
           buf[idx_tam] = 0;
           break;
         }
-        return -1;         // Domínio vazio, ponto no início ou ".."
+        return -1; // Domínio vazio, ponto no início ou ".."
       }
       buf[idx_tam] = (uint8_t)tam_rotulo; // Preenche o tamanho que estava reservado
       if (p >= tam_buf)
         return -1;
-      idx_tam = p++;       // Reserva o byte do próximo rótulo (ou do terminador)
+      idx_tam = p++; // Reserva o byte do próximo rótulo (ou do terminador)
       tam_rotulo = 0;
       if (*c == '\0') {
-        buf[idx_tam] = 0;  // Fim do domínio: byte zero que encerra o nome
+        buf[idx_tam] = 0; // Fim do domínio: byte zero que encerra o nome
         break;
       }
     } else {
       if (++tam_rotulo > 63 || p >= tam_buf)
-        return -1;         // Rótulo maior que o limite da RFC, ou buffer cheio
+        return -1;            // Rótulo maior que o limite da RFC, ou buffer cheio
       buf[p++] = (uint8_t)*c; // Copia a letra
     }
   }
 
   if (p - *pos > 255)
-    return -1;             // Nome inteiro maior que o limite da RFC (seção 3.1)
+    return -1; // Nome inteiro maior que o limite da RFC (seção 3.1)
 
-  *pos = p;                // Só atualiza a posição de quem chamou se deu tudo certo
+  *pos = p; // Só atualiza a posição de quem chamou se deu tudo certo
   return 0;
 }
 
-static size_t monta_consulta(uint8_t *buf, size_t tam_buf, uint16_t id,const char *dominio) {
+static size_t monta_consulta(uint8_t *buf, size_t tam_buf, uint16_t id, const char *dominio) {
   size_t pos = 0;
 
   // Header DNS (12 bytes)
@@ -77,11 +80,216 @@ static size_t monta_consulta(uint8_t *buf, size_t tam_buf, uint16_t id,const cha
   escreve_16(buf, &pos, 0);      // ARCOUNT = 0
 
   // Question section
-  if (escreve_nome(buf, &pos, tam_buf - 4, dominio) != 0) return 0; // QNAME
+  if (escreve_nome(buf, &pos, tam_buf - 4, dominio) != 0)
+    return 0;                // QNAME
   escreve_16(buf, &pos, 15); // QTYPE - MX
-  escreve_16(buf, &pos, 1); // QCLASS - IN
+  escreve_16(buf, &pos, 1);  // QCLASS - IN
 
   return pos;
+}
+
+// Lê um número de 16 bits e avança para o próximo
+static int le_16(const uint8_t *buf, size_t tam, size_t *pos) {
+  // Confirma se *pos + 1 < tamanho do buffer
+  if (*pos + 1 >= tam) {
+    return -1; // Erro
+  }
+
+  uint16_t valor = (uint16_t)(buf[*pos] << 8); // Coloca byte atual no byte alto
+  valor |= (uint16_t)buf[*pos + 1];            // Coloca próximo byte no byte baixo
+  *pos += 2;                                   // Avança para o próximo número de 16 bits (2 bytes)
+
+  return valor;
+}
+
+// Lê um nome de domínio da resposta e o escreve como texto em saida
+static char *le_nome(const uint8_t *resp, size_t tam, size_t *pos, char *saida, size_t tam_saida) {
+  size_t p = *pos;        // Posição de leitura local
+  size_t pos_retorno = 0; // Onde o registro continua depois do nome
+  int saltou = 0;         // 1 depois do primeiro ponteiro seguido
+  int saltos = 0;         // Quantos ponteiros já seguimos (para detectar loop)
+  size_t tam_nome = 0;    // Quantos caracteres já escrevemos em saida
+
+  while (1) {
+    // Toda leitura precisa estar dentro dos bytes recebidos
+    if (p >= tam)
+      return NULL;
+
+    uint8_t byte = resp[p];
+
+    // Byte 00: fim do nome
+    if (byte == 0) {
+      if (tam_nome >= tam_saida)
+        return NULL; // Sem espaço
+      saida[tam_nome] = '\0';
+
+      *pos = saltou ? pos_retorno : p + 1;
+      return saida;
+    }
+
+    // Dois bits mais altos iguais a 11 (byte >= 0xC0): ponteiro de 2 bytes
+    if ((byte & 0xC0) == 0xC0) {
+      if (p + 1 >= tam)
+        return NULL; // Falta o segundo byte do ponteiro
+      if (++saltos > MAX_SALTOS)
+        return NULL; // Ponteiros demais: um apontando para o outro em laço
+
+      if (!saltou) {
+        pos_retorno = p + 2; // Só o primeiro ponteiro marca onde o registro continua
+        saltou = 1;
+      }
+
+      // Os 6 bits baixos deste byte e os 8 bits do próximo formam a posição de destino
+      p = ((size_t)(byte & 0x3F) << 8) | resp[p + 1];
+      continue;
+    }
+
+    // Dois bits mais altos 01 ou 10 não são usados pela RFC 1035: formato inválido
+    if ((byte & 0xC0) != 0)
+      return NULL;
+
+    // Qualquer outro valor: número de letras que vêm a seguir
+    size_t n = byte;
+
+    if (p + 1 + n > tam)
+      return NULL; // As letras passariam do fim da resposta
+
+    // Espaço necessário em saida: '.' + letras + '\0'
+    size_t ponto = tam_nome > 0 ? 1 : 0; // Primeiro rótulo não tem ponto
+
+    if (tam_nome + ponto + n + 1 > tam_saida)
+      return NULL;
+
+    if (ponto)
+      saida[tam_nome++] = '.';                 // Separa o rótulo do anterior
+    memcpy(saida + tam_nome, resp + p + 1, n); // Copia as n letras, pulando o byte de tamanho
+    tam_nome += n;
+    p += n + 1; // Avança para o próximo rótulo: byte de tamanho + letras
+  }
+}
+
+// Informa que não foi possível obter o MX (falha do servidor ou resposta malformada)
+static int falha_coleta(const char *dominio) {
+  printf("Nao foi possível coletar entrada MX para %s\n", dominio);
+  return EXIT_FAILURE;
+}
+
+// Percorre os registros de resposta, a partir de *pos, e guarda o nome do servidor do MX de menor preferência
+static int acha_melhor_mx(const uint8_t *resp, size_t tam, size_t *pos, int ancount, char *melhor, size_t tam_melhor) {
+  // Nível de preferência do melhor MX até agora
+  int melhor_pref = -1; // -1 indica nenhum valor encontrado
+
+  // Cada volta lê um registro: NAME, TYPE, CLASS, TTL, RDLENGTH e RDATA
+  for (int i = 0; i < ancount; i++) {
+    // NAME: dono do registro.
+    char nome[TAM_MAX_NOME];
+    if (le_nome(resp, tam, pos, nome, sizeof(nome)) == NULL)
+      return -1;
+
+    // TYPE e CLASS (2 bytes cada)
+    int tipo = le_16(resp, tam, pos);
+    int classe = le_16(resp, tam, pos);
+    if (tipo < 0 || classe < 0)
+      return -1;
+
+    // TTL (4 bytes): ignorado
+    if (*pos + 4 > tam)
+      return -1;
+    *pos += 4;
+
+    // RDLENGTH (2 bytes): quantos bytes tem o RDATA
+    int rdlength = le_16(resp, tam, pos);
+    if (rdlength < 0 || *pos + (size_t)rdlength > tam)
+      return -1;
+
+    size_t fim_registro = *pos + (size_t)rdlength; // Onde o próximo registro começa
+
+    // Só nos interessam registros MX da classe IN (O resto é pulado)
+    if (tipo == TIPO_MX && classe == CLASSE_IN) {
+      // RDATA do MX: PREFERENCE (2 bytes) seguida do nome do servidor de e-mail
+      int pref = le_16(resp, tam, pos);
+      if (pref < 0)
+        return -1;
+
+      char exchange[TAM_MAX_NOME]; // Nome do servidor de e-mail do registro
+      if (le_nome(resp, tam, pos, exchange, sizeof(exchange)) == NULL)
+        return -1;
+
+      // Menor valor de preferência = servidor preferido
+      if (melhor_pref < 0 || pref < melhor_pref) {
+        melhor_pref = pref;
+        snprintf(melhor, tam_melhor, "%s", exchange); // Guarda uma cópia do nome
+      }
+    }
+
+    *pos = fim_registro; // Vai para o próximo registro
+  }
+
+  return melhor_pref >= 0; // Retorna se achou algum MX
+}
+
+// Interpreta a resposta e imprime o resultado formatado
+static int interpreta_resposta(const uint8_t *resp, size_t tam, const char *dominio) {
+  size_t pos = 0;
+
+  // ID (2 bytes):
+  pos += 2; // Pulamos
+
+  // Flags (2 bytes):
+  int flags = le_16(resp, tam, &pos);
+  if (flags < 0)
+    return falha_coleta(dominio);
+
+  int rcode = flags & 0x000F; // Pega últimos 4 bits
+
+  // RCODE 3: o domínio não existe
+  if (rcode == 3) {
+    printf("Dominio %s nao encontrado\n", dominio);
+    return EXIT_FAILURE;
+  }
+
+  // Qualquer outro RCODE diferente de 0 é uma falha do servidor
+  if (rcode != 0)
+    return falha_coleta(dominio);
+
+  // QDCOUNT (2 bytes): quantas perguntas a resposta repete
+  int qdcount = le_16(resp, tam, &pos);
+
+  // ANCOUNT (2 bytes): quantos registros de resposta vêm a seguir
+  int ancount = le_16(resp, tam, &pos);
+  if (qdcount < 0 || ancount < 0)
+    return falha_coleta(dominio);
+
+  // NSCOUNT e ARCOUNT (4 bytes):
+  pos += 4; // Pulamos
+
+  // Seção de pergunta: para cada pergunta, pula o nome e depois TYPE e CLASS (4 bytes)
+  for (int i = 0; i < qdcount; i++) {
+    char nome[TAM_MAX_NOME]; // Texto do nome da pergunta: não usamos, só avançamos o pos
+    if (le_nome(resp, tam, &pos, nome, sizeof(nome)) == NULL)
+      return falha_coleta(dominio);
+
+    if (pos + 4 > tam)
+      return falha_coleta(dominio);
+    pos += 4; // Pulamos TYPE e CLASS
+  }
+
+  // Seção de respostas: procura o MX de menor preferência
+  char melhor[TAM_MAX_NOME]; // Nome do servidor de e-mail preferido
+  int achou = acha_melhor_mx(resp, tam, &pos, ancount, melhor, sizeof(melhor));
+
+  // Resposta malformada
+  if (achou < 0)
+    return falha_coleta(dominio);
+
+  // Nenhum registro MX na resposta (inclui o caso do CNAME, como fga.unb.br)
+  if (achou == 0) {
+    printf("Dominio %s nao possui entrada MX\n", dominio);
+    return EXIT_FAILURE;
+  }
+
+  printf("%s <> %s\n", dominio, melhor);
+  return EXIT_SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
@@ -90,18 +298,19 @@ int main(int argc, char *argv[]) {
   if (argc != 3) {
     fprintf(stderr,
             "Erro: Numero de argumentos inválido\n"
-            "Uso: %s <dominio> <ip_servidor> \n",argv[0]);
+            "Uso: %s <dominio> <ip_servidor> \n",
+            argv[0]);
     return EXIT_FAILURE;
   }
 
-  char *dominio = argv[1];
-  char *ip = argv[2];
+  const char *dominio = argv[1];
+  const char *ip = argv[2];
 
   // Prepara o endereço do servidor DNS
   struct sockaddr_in servidor;
   memset(&servidor, 0, sizeof(servidor)); // Zera o struct para eliminar lixo de memória
-  servidor.sin_family = AF_INET; // https://www.ibm.com/docs/pt-br/i/7.6.0?topic=family-af-inet-address
-  servidor.sin_port = htons(PORTA_DNS); // Converte o número da porta para a ordem de bytes da rede
+  servidor.sin_family = AF_INET;          // https://www.ibm.com/docs/pt-br/i/7.6.0?topic=family-af-inet-address
+  servidor.sin_port = htons(PORTA_DNS);   // Converte o número da porta para a ordem de bytes da rede
 
   if (inet_pton(AF_INET, ip, &servidor.sin_addr) != 1) {
     fprintf(stderr, "Erro: IP invalido: %s\n", ip);
@@ -139,11 +348,11 @@ int main(int argc, char *argv[]) {
   }
 
   uint8_t resposta[TAM_MAX_DNS] = {0}; // Buffer da resposta
-  ssize_t recebidos = -1;              
+  ssize_t recebidos = -1;
 
   for (int tentativa = 0; tentativa < MAX_TENTATIVAS; tentativa++) {
     // Envia (ou reenvia) a consulta
-    ssize_t enviados = sendto(sock, consulta, tam_consulta, 0,(struct sockaddr *)&servidor, sizeof(servidor));
+    ssize_t enviados = sendto(sock, consulta, tam_consulta, 0, (struct sockaddr *)&servidor, sizeof(servidor));
     if (enviados < 0) {
       perror("sendto");
       close(sock);
@@ -177,14 +386,5 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Temporário: mostra os bytes recebidos para conferência
-  printf("Resposta (%zd bytes):\n", recebidos);
-  for (ssize_t i = 0; i < recebidos; i++) {
-    printf("%02x ", resposta[i]);
-    if ((i + 1) % 16 == 0)
-      printf("\n");
-  }
-  printf("\n");
-
-  return EXIT_SUCCESS;
+  return interpreta_resposta(resposta, (size_t)recebidos, dominio);
 }
