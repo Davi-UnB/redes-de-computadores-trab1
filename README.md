@@ -186,7 +186,6 @@ O mecanismo de tempo limite foi testado com um servidor DNS local simulado, nos 
 ├── meu_cliente.c            # código-fonte completo
 ├── Makefile                 # compilação
 ├── README.md                # esta documentação
-├── enunciado.pdf            # enunciado do trabalho
 └── docs/
     └── casos-de-teste.md    # respostas de referência obtidas com dig
 ```
@@ -197,5 +196,6 @@ O mecanismo de tempo limite foi testado com um servidor DNS local simulado, nos 
 
 - MOCKAPETRIS, P. **RFC 1034** — *Domain Names: Concepts and Facilities*. IETF, 1987.
 - MOCKAPETRIS, P. **RFC 1035** — *Domain Names: Implementation and Specification*. IETF, 1987.
-- LEVINE, J.; HOGAN, M. **RFC 7505** — *A "Null MX" No Service Resource Record for Domains That Accept No Mail*. IETF, 2015.
+- KLENSIN, J. **RFC 5321** — *Simple Mail Transfer Protocol*. IETF, 2008.
+- LEVINE, J.; DELANY, M. **RFC 7505** — *A "Null MX" No Service Resource Record for Domains That Accept No Mail*. IETF, 2015.
 - MITCHELL, Mark; OLDHAM, Jeffrey; SAMUEL, Alex. *Advanced Linux Programming*. New Riders, 2001.
