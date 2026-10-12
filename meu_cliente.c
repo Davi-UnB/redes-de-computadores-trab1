@@ -82,8 +82,8 @@ static size_t monta_consulta(uint8_t *buf, size_t tam_buf, uint16_t id, const ch
   // Question section
   if (escreve_nome(buf, &pos, tam_buf - 4, dominio) != 0)
     return 0;                // QNAME
-  escreve_16(buf, &pos, 15); // QTYPE - MX
-  escreve_16(buf, &pos, 1);  // QCLASS - IN
+  escreve_16(buf, &pos, TIPO_MX); // QTYPE - MX
+  escreve_16(buf, &pos, CLASSE_IN);  // QCLASS - IN
 
   return pos;
 }
@@ -215,8 +215,8 @@ static int acha_melhor_mx(const uint8_t *resp, size_t tam, size_t *pos, int anco
       if (le_nome(resp, tam, pos, exchange, sizeof(exchange)) == NULL)
         return -1;
 
-      // Menor valor de preferência = servidor preferido
-      if (melhor_pref < 0 || pref < melhor_pref) {
+      // Nome vazio é "null MX" (RFC 7505): o domínio declara que não recebe e-mail
+      if (exchange[0] != '\0' && (melhor_pref < 0 || pref < melhor_pref)){
         melhor_pref = pref;
         snprintf(melhor, tam_melhor, "%s", exchange); // Guarda uma cópia do nome
       }
@@ -381,10 +381,8 @@ int main(int argc, char *argv[]) {
 
   close(sock); // O socket não é mais necessário
 
-  if (recebidos < 0) {
-    printf("Nao foi possível coletar entrada MX para %s\n", dominio);
-    return EXIT_FAILURE;
-  }
+  if (recebidos < 0)
+    return falha_coleta(dominio); // Nenhuma resposta válida após todas as tentativas
 
   return interpreta_resposta(resposta, (size_t)recebidos, dominio);
 }
