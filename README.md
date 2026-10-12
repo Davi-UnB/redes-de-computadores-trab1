@@ -186,7 +186,6 @@ O mecanismo de tempo limite foi testado com um servidor DNS local simulado, nos 
 ├── meu_cliente.c            # código-fonte completo
 ├── Makefile                 # compilação
 ├── README.md                # esta documentação
-├── .clang-format            # estilo de formatação do código
 ├── enunciado.pdf            # enunciado do trabalho
 └── docs/
     └── casos-de-teste.md    # respostas de referência obtidas com dig
