@@ -81,9 +81,9 @@ static size_t monta_consulta(uint8_t *buf, size_t tam_buf, uint16_t id, const ch
 
   // Question section
   if (escreve_nome(buf, &pos, tam_buf - 4, dominio) != 0)
-    return 0;                // QNAME
-  escreve_16(buf, &pos, TIPO_MX); // QTYPE - MX
-  escreve_16(buf, &pos, CLASSE_IN);  // QCLASS - IN
+    return 0;                       // QNAME
+  escreve_16(buf, &pos, TIPO_MX);   // QTYPE - MX
+  escreve_16(buf, &pos, CLASSE_IN); // QCLASS - IN
 
   return pos;
 }
@@ -215,8 +215,9 @@ static int acha_melhor_mx(const uint8_t *resp, size_t tam, size_t *pos, int anco
       if (le_nome(resp, tam, pos, exchange, sizeof(exchange)) == NULL)
         return -1;
 
-      // Nome vazio é "null MX" (RFC 7505): o domínio declara que não recebe e-mail
-      if (exchange[0] != '\0' && (melhor_pref < 0 || pref < melhor_pref)){
+      // Menor valor de preferência = servidor preferido. Um nome vazio ("null MX", RFC 7505) também entra aqui:
+      // o programa mostra o que o servidor respondeu, sem interpretar a intenção do domínio
+      if (melhor_pref < 0 || pref < melhor_pref) {
         melhor_pref = pref;
         snprintf(melhor, tam_melhor, "%s", exchange); // Guarda uma cópia do nome
       }
